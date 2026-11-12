@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as urlmatch from "../src/urlmatch.ts";
 import { build, defaultUrl, Meta, parseMeta, urlRuns } from "../src/userscript.ts";
-import { Store } from "../src/scripts_store.ts";
+import { Store } from "../src/scriptsStore.ts";
 import { main } from "../src/cli.ts";
 import { VERSION } from "../src/version.ts";
 
@@ -215,6 +215,7 @@ describe("Userscript Meta", () => {
 // ==/UserScript==
 console.log("hello");
 `;
+
     const meta = parseMeta(src, "test.user.ts");
     expect(meta.name).toBe("Test Script");
     expect(meta.id).toBe("test-script");
@@ -248,7 +249,7 @@ describe("Store", () => {
   it("applies installs and uninstalls cleanly", async () => {
     const store = new Store(root);
     store.open(true);
-    store.lock();
+    expect(store.tryLock()).toBe(true);
 
     const scriptDir = join(tmpdir(), `bay-script-test-${Date.now()}`);
     mkdirSync(scriptDir, { recursive: true });
@@ -275,10 +276,13 @@ describe("CLI entrypoint", () => {
   it("prints version", async () => {
     let output = "";
     const origWrite = process.stdout.write;
+    // SAFETY: the stub matches process.stdout.write's text-chunk signature and returns true; the original is restored in finally.
     process.stdout.write = ((chunk: string) => {
       output += chunk;
+
       return true;
     }) as never;
+
     try {
       const code = await main(["--version"]);
       expect(code).toBe(0);

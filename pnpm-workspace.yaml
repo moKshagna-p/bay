@@ -5,6 +5,10 @@ packages:
   - "!apps/web"
   # The CLI is a standalone Bun tool (apps/cli).
   - "!apps/cli"
+  # The release videos are a standalone Remotion project (apps/videos).
+  - "!apps/videos"
+  # The mobile app is a standalone Expo project on a newer React Native (apps/mobile).
+  - "!apps/mobile"
 
 # React Native + CocoaPods expect a flat node_modules (the Podfile and Metro
 # resolve react-native-macos by path), so hoist instead of pnpm's symlink store.
@@ -19,3 +23,9 @@ patchedDependencies:
   expo-constants@18.0.14: patches/expo-constants@18.0.14.patch
   expo-modules-core@3.0.30: patches/expo-modules-core@3.0.30.patch
   react-native-macos@0.81.9: patches/react-native-macos@0.81.9.patch
+
+# The desktop runtime pins Effect exactly (docs/desktop-effect-plan.html). 4.1.3 is
+# the version the plan was written against, and it was published the same day, so
+# pnpm's release-age rule would otherwise refuse it.
+minimumReleaseAgeExclude:
+  - effect@4.1.3

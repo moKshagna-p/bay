@@ -11,15 +11,15 @@ import {
   setAutofillSettings,
   type SavedAddress,
   type SavedCard,
-} from "@bay/nncore";
-import { confirm, copyText, Symbol } from "@bay/shell";
+} from "@bay/chromium";
+import { confirm, copyText, Symbol } from "@bay/desktop";
 import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import { useTheme } from "../../../lib/theme";
-import { useBrowser } from "../../../store/browser";
+import { useBrowser } from "../../../store/browserStore";
 import { useSpaces } from "../../../store/hooks";
 import { engineProfile } from "../../../store/model";
-import { IconButton } from "../../primitives";
+import { IconButton } from "../../ui/primitives";
 import { NetworkBadge } from "../../site/Autofill";
 import { Button, Group, PopUp, Row, SectionHeader, Sheet, TextField, Toggle, type Option } from "../controls";
 import { SETTINGS } from "../definitions";
@@ -34,26 +34,32 @@ export function AutofillPane({ spaceId: initial }: { spaceId?: string | null }) 
   const [enabled, setEnabled] = useState<{ addresses: boolean; cards: boolean } | null>(null);
   const profile = engineProfile(spaceId);
 
-  const load = () => {
+  // The lists of the profile asked for: an answer for a profile the pane has since left is dropped.
+  const load = (live: () => boolean = () => true) => {
     const addressesLoaded = listAddresses(profile)
-      .then(setAddresses)
-      .catch(() => setAddresses([]));
+      .then((list) => live() && setAddresses(list))
+      .catch(() => live() && setAddresses([]));
+
     void listCards(profile)
-      .then(setCards)
-      .catch(() => setCards([]));
+      .then((list) => live() && setCards(list))
+      .catch(() => live() && setCards([]));
+
     return addressesLoaded;
   };
+
   useEffect(() => {
     setEnabled(null);
     // Load prefs after the profile list initializes its request context.
     let current = true;
-    void load().then(() =>
+    void load(() => current).then(() =>
       getAutofillSettings(profile)
         .then((e) => current && setEnabled(e))
         .catch(() => {}),
     );
+
     return () => void (current = false);
   }, [spaceId]);
+
   const toggle = (key: "addresses" | "cards", value: boolean) =>
     void setAutofillSettings({ [key]: value }, profile).then(() => setEnabled((e) => e && { ...e, [key]: value }));
 
@@ -126,6 +132,7 @@ const firstLine = (street?: string) => street?.split("\n")[0] ?? "";
 
 function addressSummary(a: SavedAddress) {
   const place = [a.city, a.state, a.postalCode].filter(Boolean).join(" ");
+
   return [a.name ? firstLine(a.street) : "", place, a.email].filter(Boolean).join(", ");
 }
 
@@ -134,11 +141,13 @@ const pad = (n: number) => String(n).padStart(2, "0");
 function isExpired(c: SavedCard) {
   if (!c.expMonth || !c.expYear) return false;
   const now = new Date();
+
   return c.expYear < now.getFullYear() || (c.expYear === now.getFullYear() && c.expMonth < now.getMonth() + 1);
 }
 
 function cardSummary(c: SavedCard) {
   const expiry = c.expMonth && c.expYear ? `${isExpired(c) ? "Expired" : "Expires"} ${pad(c.expMonth)}/${pad(c.expYear % 100)}` : "";
+
   return [expiry, c.name].filter(Boolean).join(" · ");
 }
 
@@ -146,12 +155,15 @@ function formatCardNumber(digits: string) {
   const groups = /^3[47]/.test(digits) ? [4, 6, 5] : [4, 4, 4, 4, 3];
   const out: string[] = [];
   let i = 0;
+
   for (const g of groups) {
     if (i >= digits.length) break;
     out.push(digits.slice(i, i + g));
     i += g;
   }
+
   if (i < digits.length) out.push(digits.slice(i));
+
   return out.join(" ");
 }
 
@@ -161,6 +173,7 @@ function FormRow({ title, children }: { title: string; children: React.ReactNode
 
 async function confirmDelete(title: string, message: string) {
   const { confirmed } = await confirm({ title, message, confirmTitle: "Delete", destructive: true });
+
   return confirmed;
 }
 
@@ -191,6 +204,7 @@ const ADDRESS_FIELDS: { key: keyof SavedAddress | "line1" | "line2"; title: stri
 function AddressSheet({ profile, saved, onChanged }: { profile: string; saved?: SavedAddress; onChanged: () => void }) {
   const theme = useTheme();
   const [lines] = useState(() => (saved?.street ?? "").split("\n"));
+
   const [values, setValues] = useState<Record<string, string>>(() => ({
     name: saved?.name ?? "",
     organization: saved?.organization ?? "",
@@ -203,19 +217,26 @@ function AddressSheet({ profile, saved, onChanged }: { profile: string; saved?: 
     phone: saved?.phone ?? "",
     email: saved?.email ?? "",
   }));
+
   const set = (key: string) => (text: string) => setValues((v) => ({ ...v, [key]: text }));
   const empty = Object.values(values).every((v) => !v.trim());
 
   const save = async () => {
     const { line1, line2, ...rest } = values;
+
     const street = [line1, line2]
-      .map((l) => l!.trim())
-      .filter(Boolean)
+      .flatMap((l) => {
+        const trimmed = l!.trim();
+
+        return trimmed ? [trimmed] : [];
+      })
       .join("\n");
+
     await saveAddress(profile, { ...rest, street, id: saved?.id });
     onChanged();
     closeSettingsSheet();
   };
+
   const remove = async () => {
     if (!saved || !(await confirmDelete("Delete this address?", "It won't be offered in forms any more."))) return;
     await deleteAddress(profile, saved.id);
@@ -247,10 +268,13 @@ function AddressSheet({ profile, saved, onChanged }: { profile: string; saved?: 
 }
 
 const MONTHS: Option<string>[] = [{ value: "", title: "Month" }, ...Array.from({ length: 12 }, (_, i) => ({ value: String(i + 1), title: pad(i + 1) }))];
+
 function yearOptions(current?: number): Option<string>[] {
   const now = new Date().getFullYear();
   const years = Array.from({ length: 16 }, (_, i) => now + i);
+
   if (current && !years.includes(current)) years.unshift(current);
+
   return [{ value: "", title: "Year" }, ...years.map((y) => ({ value: String(y), title: String(y) }))];
 }
 
@@ -266,15 +290,19 @@ function CardSheet({ profile, saved, onChanged }: { profile: string; saved?: Sav
   const reveal = async () => {
     if (!saved) return;
     const full = await revealCardNumber(profile, saved.id);
+
     if (full) setNumber(formatCardNumber(full));
   };
+
   const save = async () => {
     const card = { id: saved?.id, name: name.trim(), expMonth: month ? Number(month) : undefined, expYear: year ? Number(year) : undefined };
     const id = await saveCard(profile, card, number === null ? undefined : digits);
+
     if (!id) return setError("That isn't a valid card number.");
     onChanged();
     closeSettingsSheet();
   };
+
   const remove = async () => {
     if (!saved || !(await confirmDelete("Delete this card?", "Its number is removed from your Keychain too."))) return;
     await deleteCard(profile, saved.id);

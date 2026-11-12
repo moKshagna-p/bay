@@ -1,15 +1,32 @@
-import { devCrash } from "@bay/shell";
+import { devCrash } from "@bay/desktop";
 import { createElement } from "react";
 import { devState, flush, requestLog, setSharing, useTelemetry } from "./client";
 import { captureException, installErrorReporting, reportNativeCrashes } from "./errors";
 import { devOmniboxSampler } from "./track";
-import { devHourly, sessionEnding, startUsage } from "./usage";
+import * as Effect from "effect/Effect";
+import { runDesktop } from "../effect/runtime";
+import { sessionEnding, startUsage } from "./usage";
+import { UsageService } from "./usageService";
 
 export { installErrorReporting };
 
+// The hourly sample, now, and what it queued sent: the dev harness's way to see it without waiting an hour.
+async function devHourly() {
+  await runDesktop(
+    Effect.gen(function* () {
+      const usage = yield* UsageService;
+
+      yield* usage.sampleNow;
+    }),
+  );
+  await flush();
+}
+
 export function startTelemetry() {
   startUsage();
+
   if (__DEV__) {
+    // SAFETY: nnTelemetry is telemetry's own dev-harness surface, read only by tests.
     (globalThis as { nnTelemetry?: unknown }).nnTelemetry = {
       store: useTelemetry,
       state: devState,
@@ -28,7 +45,10 @@ export function startTelemetry() {
         ),
       rejectTestPromise: () => void Promise.reject(new RangeError("Telemetry test rejection at https://private.example/x")),
       showWhatsSent: () => {
+        // SAFETY: require returns the sheet module, which exports showSettingsSheet.
         const { showSettingsSheet } = require("../components/settings/sheet") as typeof import("../components/settings/sheet");
+
+        // SAFETY: require returns the diagnostics pane module, which exports WhatsSentSheet.
         const { WhatsSentSheet } = require("../components/settings/panes/ShareDiagnostics") as typeof import("../components/settings/panes/ShareDiagnostics");
         showSettingsSheet(createElement(WhatsSentSheet));
       },

@@ -1,24 +1,19 @@
-import { engineInfo } from "@bay/nncore";
-import { launchEnvironment, readDocument, systemInfo, writeDocument, type SystemInfo } from "@bay/shell";
+// The app's telemetry: the consent, the queue, and the choice the user made.
+//
+// The delivery is in telemetry/service.ts: this module keeps what the app has decided to share and hands the sending
+// to the service. The opt-out is plain and immediate: it changes the generation, stops the uploads in flight and
+// clears the queue and the identity at once, without waiting for a delivery that may be running.
+import { engineInfo } from "@bay/chromium";
+import { readDocument, systemInfo, writeDocument, type SystemInfo } from "@bay/desktop";
 import { create } from "zustand";
-import {
-  BATCH_SIZE,
-  DEV_SEND_ENV,
-  EVENTS_SCOPE,
-  FLUSH_DELAY_MS,
-  LOGS_SCOPE,
-  LOGS_URL,
-  MAX_BACKOFF_MS,
-  MAX_BODY_BYTES,
-  MAX_EVENTS,
-  MAX_LOGS,
-  TELEMETRY_QUEUE_DOC,
-  TELEMETRY_REQUEST_LOG_DOC,
-  TELEMETRY_STATE_DOC,
-  URGENT_FLUSH_DELAY_MS,
-} from "./config";
-import { eventRecord, logRecord, logsRequest, outcome, type OtlpLogRecord, type QueuedEvent } from "./otlp";
+import * as Effect from "effect/Effect";
+import type { JsonValue } from "../lib/json";
+import { EVENTS_SCOPE, LOGS_SCOPE, MAX_EVENTS, MAX_LOGS, TELEMETRY_QUEUE_DOC, TELEMETRY_REQUEST_LOG_DOC, TELEMETRY_STATE_DOC } from "./config";
+import { eventRecord, logRecord, logsRequest, type OtlpLogRecord, type QueuedEvent } from "./otlp";
 import { cleanProperties } from "./sanitize";
+import { canSend, DiagnosticsService, type RequestLogEntry, type TelemetryConsole, type TelemetryQueueView } from "./service";
+
+export type { RequestLogEntry } from "./service";
 
 // Send only with opt-in; never sync the choice.
 
@@ -47,6 +42,8 @@ const DEFAULT: Saved = {
 function readJson<T>(name: string): T | null {
   try {
     const json = readDocument(name);
+
+    // SAFETY: JSON.parse yields the persisted telemetry document shape written by writeDocument for this name.
     return json ? (JSON.parse(json) as T) : null;
   } catch {
     return null;
@@ -57,9 +54,11 @@ let saved: Saved = { ...DEFAULT };
 
 function save(patch: Partial<Saved>) {
   saved = { ...saved, ...patch };
+
   try {
     writeDocument(TELEMETRY_STATE_DOC, JSON.stringify(saved));
   } catch {}
+
   useTelemetry.setState({ sharing: saved.sharing, decided: saved.decidedAt !== null, askDone: saved.askDoneAt !== null });
 }
 
@@ -79,11 +78,13 @@ let engineVersion: string | null = null;
 
 export const environment = (): "dev" | "test" | "production" => (__DEV__ ? "dev" : appInfo().isolatedInstance ? "test" : "production");
 
-const devSendAllowed = () => launchEnvironment(DEV_SEND_ENV) === "1";
-const canSend = () => !__DEV__ || devSendAllowed();
+export interface TelemetryContext {
+  [attribute: string]: string | number | boolean | null;
+}
 
-function context(): Record<string, unknown> {
+function context(): TelemetryContext {
   const info = appInfo();
+
   return {
     $lib: "bay-telemetry",
     $lib_version: "1",
@@ -105,133 +106,77 @@ function context(): Record<string, unknown> {
 type Queue = { version: 1; events: QueuedEvent[]; logs: OtlpLogRecord[] };
 
 let queue: Queue = { version: 1, events: [], logs: [] };
+
+// The queue's generation. It moves when the user turns sharing off, and whatever was in flight belongs to the
+// generation it started in.
 let generation = 0;
 
 let persistTimer: ReturnType<typeof setTimeout> | undefined;
+
 function persistQueue(now = false) {
   clearTimeout(persistTimer);
   persistTimer = undefined;
+
   const write = () => {
     try {
       writeDocument(TELEMETRY_QUEUE_DOC, JSON.stringify(queue));
     } catch {}
   };
+
   if (now) write();
   else persistTimer = setTimeout(write, 2000);
 }
 
 function clearQueue() {
   queue = { version: 1, events: [], logs: [] };
-  clearTimeout(flushTimer);
-  flushTimer = undefined;
   persistQueue(true);
+  changed();
 }
 
 let droppedWhileOff = 0;
 
 export type CaptureOptions = {
-  raw?: Record<string, unknown>;
+  raw?: Record<string, JsonValue>;
   urgent?: boolean;
   persist?: boolean;
 };
 
-export function capture(event: string, props: Record<string, unknown> = {}, options: CaptureOptions = {}) {
-  if (!saved.sharing || !saved.installId) {
-    droppedWhileOff++;
-    return;
-  }
-  try {
-    queue.events.push({
-      uuid: uuidv7(),
-      event,
-      distinct_id: saved.installId,
-      timestamp: new Date().toISOString(),
-      properties: { ...context(), ...cleanProperties(props), ...options.raw },
-    });
-    if (queue.events.length > MAX_EVENTS) queue.events.splice(0, queue.events.length - MAX_EVENTS);
-    persistQueue(options.persist);
-    scheduleFlush(options.urgent ? URGENT_FLUSH_DELAY_MS : FLUSH_DELAY_MS);
-  } catch {}
-}
+// MARK: What the service sees
 
-export function queueLog(level: "warn" | "error", message: string, attributes: Record<string, string | number | boolean>) {
-  if (!saved.sharing) return;
-  try {
-    queue.logs.push(logRecord(level, message, attributes));
-    if (queue.logs.length > MAX_LOGS) queue.logs.splice(0, queue.logs.length - MAX_LOGS);
-    persistQueue();
-    scheduleFlush(FLUSH_DELAY_MS);
-  } catch {}
-}
+// The uploads in flight: the opt-out stops them, without waiting for the delivery that is running.
+const inflight = new Set<() => void>();
 
-// MARK: Sending
-
-let flushTimer: ReturnType<typeof setTimeout> | undefined;
-let flushDueAt = 0;
-let flushing = false;
-let failures = 0;
-let retryAt = 0;
-
-function scheduleFlush(delay: number) {
-  if (!saved.sharing) return;
-  const due = Math.max(Date.now() + delay, retryAt);
-  if (flushTimer && flushDueAt <= due) return;
-  clearTimeout(flushTimer);
-  flushDueAt = due;
-  flushTimer = setTimeout(() => void flush(), due - Date.now());
-}
-
-export type RequestLogEntry = {
-  at: string;
-  kind: "events" | "logs";
-  url: string;
-  count: number;
-  bytes: number;
-  status: number | null;
-  dryRun?: boolean;
-};
-
+// The requests that were sent, for the app's own diagnostics.
 const requests: RequestLogEntry[] = [];
 
 export const requestLog = (): readonly RequestLogEntry[] => requests;
 
+// The listeners the schedule hears from: the queue changed, so the grid may have work to do.
+const listeners = new Set<() => void>();
+
+const changed = () => {
+  for (const listener of listeners) listener();
+};
+
+// A request that went out, written down so the app can show what was sent.
 function logRequest(entry: RequestLogEntry, body: string) {
   requests.push(entry);
+
   if (requests.length > 200) requests.shift();
+
   if (__DEV__) {
     try {
       const line = JSON.stringify({ ...entry, body: JSON.parse(body) });
       writeDocument(TELEMETRY_REQUEST_LOG_DOC, (readDocument(TELEMETRY_REQUEST_LOG_DOC) ?? "").slice(-400_000) + `${line}\n`);
     } catch {}
   }
+
   if (__DEV__) console.log(`[telemetry] ${entry.dryRun ? "dry run" : "POST"} ${entry.url} ${entry.kind}×${entry.count} → ${entry.status}`);
 }
 
-// Uploads in flight, so turning sharing off can stop them mid-request.
-const inflight = new Set<AbortController>();
-
-async function post(kind: RequestLogEntry["kind"], url: string, body: string, count: number) {
-  const entry: RequestLogEntry = { at: new Date().toISOString(), kind, url, count, bytes: body.length, status: null };
-  if (!canSend()) {
-    logRequest({ ...entry, dryRun: true }, body);
-    return 200;
-  }
-  const abort = new AbortController();
-  inflight.add(abort);
-  try {
-    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, signal: abort.signal });
-    entry.status = response.status;
-  } catch {
-    entry.status = 0;
-  } finally {
-    inflight.delete(abort);
-  }
-  logRequest(entry, body);
-  return entry.status;
-}
-
-function resource(): Record<string, unknown> {
+function resource(): TelemetryContext {
   const info = appInfo();
+
   return {
     "service.name": "bay-app",
     "service.version": info.appVersion,
@@ -254,68 +199,145 @@ const eventsBody = (batch: QueuedEvent[]) =>
 
 const logsBody = (batch: OtlpLogRecord[]) => logsRequest(resource(), LOGS_SCOPE, batch);
 
-// Sends the head of a queue in batches until it's empty or the server says to retry later.
-type DrainResult = "done" | "failed" | "stale";
+const events: TelemetryQueueView<QueuedEvent> = {
+  kind: "events",
+  take: () => queue.events,
+  body: (batch) => eventsBody(batch),
+  remove: (batch) => {
+    queue.events = queue.events.filter((e) => !batch.includes(e));
 
-async function drain<T>(
-  kind: RequestLogEntry["kind"],
-  take: () => T[],
-  encode: (batch: T[]) => string,
-  remove: (batch: T[]) => void,
-  gen: number,
-): Promise<DrainResult> {
-  let size = BATCH_SIZE;
-  for (let batch = take().slice(0, size); batch.length; batch = take().slice(0, size)) {
-    const body = encode(batch);
-    if (body.length > MAX_BODY_BYTES && batch.length > 1) {
-      size = Math.ceil(batch.length / 2);
-      continue;
-    }
-    const status = await post(kind, LOGS_URL, body, batch.length);
-    if (gen !== generation) return "stale";
-    const result = outcome(status, batch.length);
-    if (result === "retry") return "failed";
-    if (result === "split") size = Math.ceil(batch.length / 2);
-    else remove(batch);
+    // The queue is smaller now: the grid may have nothing left to do.
+    changed();
+  },
+};
+
+const logs: TelemetryQueueView<OtlpLogRecord> = {
+  kind: "logs",
+  take: () => queue.logs,
+  body: (batch) => logsBody(batch),
+  remove: (batch) => {
+    queue.logs = queue.logs.filter((l) => !batch.includes(l));
+
+    changed();
+  },
+};
+
+// The queue the app left on disk, as it was written.
+function parseQueue(contents: string): Queue | null {
+  try {
+    // SAFETY: JSON.parse yields the queue document shape written by persistQueue for this name.
+    const stored = JSON.parse(contents) as Partial<Queue>;
+
+    if (stored.version !== 1) return null;
+
+    return { version: 1, events: stored.events ?? [], logs: stored.logs ?? [] };
+  } catch {
+    return null;
   }
-  return "done";
 }
 
-export async function flush() {
-  flushTimer = undefined;
-  if (!saved.sharing || flushing) return;
-  flushing = true;
-  const gen = generation;
-  let result: DrainResult;
+// The queue the service sends, as the app's own code keeps it. It is exported so the service's tests can drive the
+// real thing.
+export const telemetryConsole: TelemetryConsole = {
+  sharing: () => saved.sharing,
+  generation: () => generation,
+  events,
+  logs,
+  inflight,
+  recorded: (entry, body) => logRequest(entry, body),
+  serialized: () => JSON.stringify(queue),
+  restore: (contents) => {
+    // Nothing that was queued before the user opted out comes back.
+    if (!saved.sharing) return;
+
+    const stored = parseQueue(contents);
+
+    if (!stored) return;
+
+    queue = { version: 1, events: [...stored.events, ...queue.events], logs: [...stored.logs, ...queue.logs] };
+    changed();
+  },
+  subscribe: (listener) => {
+    listeners.add(listener);
+
+    return () => {
+      listeners.delete(listener);
+    };
+  },
+};
+
+// MARK: Sending
+
+// The desktop runtime is reached when there is something to send. The import is a promise on purpose: the runtime's
+// own diagnostics reach this module (the consent gate is here), and a static import would close that loop.
+const desktop = () => import("../effect/runtime");
+
+// The delivery is the service's work: the app asks, and the service sends on the app's shared grid.
+const startDelivery = async () => {
+  const { runDesktop } = await desktop();
+
+  await runDesktop(
+    Effect.gen(function* () {
+      const diagnostics = yield* DiagnosticsService;
+
+      yield* diagnostics.start(telemetryConsole);
+    }),
+  ).catch(() => {});
+};
+
+const deliver = async () => {
+  const { runDesktop } = await desktop();
+
+  await runDesktop(
+    Effect.gen(function* () {
+      const diagnostics = yield* DiagnosticsService;
+
+      yield* diagnostics.start(telemetryConsole);
+      yield* diagnostics.deliver();
+    }),
+  ).catch(() => {});
+};
+
+export function capture(event: string, props: Record<string, JsonValue> = {}, options: CaptureOptions = {}) {
+  if (!saved.sharing || !saved.installId) {
+    droppedWhileOff++;
+
+    return;
+  }
+
   try {
-    result = await drain(
-      "events",
-      () => queue.events,
-      eventsBody,
-      (batch) => (queue.events = queue.events.filter((e) => !batch.includes(e))),
-      gen,
-    );
-    if (result === "done")
-      result = await drain(
-        "logs",
-        () => queue.logs,
-        logsBody,
-        (batch) => (queue.logs = queue.logs.filter((l) => !batch.includes(l))),
-        gen,
-      );
-  } finally {
-    flushing = false;
-  }
-  if (result === "stale") return;
-  persistQueue(true);
-  if (result === "failed") {
-    failures++;
-    retryAt = Date.now() + Math.min(MAX_BACKOFF_MS, 30_000 * 2 ** (failures - 1));
-    scheduleFlush(0);
-  } else {
-    failures = 0;
-    retryAt = 0;
-  }
+    queue.events.push({
+      uuid: uuidv7(),
+      event,
+      distinct_id: saved.installId,
+      timestamp: new Date().toISOString(),
+      properties: { ...context(), ...cleanProperties(props), ...options.raw },
+    });
+
+    if (queue.events.length > MAX_EVENTS) queue.events.splice(0, queue.events.length - MAX_EVENTS);
+    persistQueue(options.persist);
+    changed();
+
+    // A fatal error has to go out before the app goes down.
+    if (options.urgent) void deliver();
+  } catch {}
+}
+
+export function queueLog(level: "warn" | "error", message: string, attributes: Record<string, string | number | boolean>) {
+  if (!saved.sharing) return;
+
+  try {
+    queue.logs.push(logRecord(level, message, attributes));
+
+    if (queue.logs.length > MAX_LOGS) queue.logs.splice(0, queue.logs.length - MAX_LOGS);
+    persistQueue();
+    changed();
+  } catch {}
+}
+
+/** Sends the queue now, and waits for the batches that went out. */
+export async function flush() {
+  await deliver();
 }
 
 // MARK: The user's choice
@@ -324,17 +346,22 @@ export type SharingSource = "settings" | "onboarding" | "ask";
 
 export function setSharing(on: boolean, source: SharingSource) {
   const now = Date.now();
+
   if (on === saved.sharing) return save({ decidedAt: now, askDoneAt: saved.askDoneAt ?? now });
+
+  // The queue belongs to the choice that has just changed: what is in flight stops, and what is waiting is gone.
   generation++;
-  failures = 0;
-  retryAt = 0;
+
   if (!on) {
-    for (const abort of inflight) abort.abort();
+    for (const stop of inflight) stop();
     inflight.clear();
+
     save({ sharing: false, installId: null, sessionOpen: false, decidedAt: now, askDoneAt: saved.askDoneAt ?? now });
     clearQueue();
+
     return;
   }
+
   save({
     sharing: true,
     installId: uuidv4(),
@@ -345,6 +372,7 @@ export function setSharing(on: boolean, source: SharingSource) {
     askDoneAt: saved.askDoneAt ?? now,
   });
   capture("sharing_turned_on", { source });
+  void startDelivery();
 }
 
 export const dismissAsk = () => save({ askDoneAt: Date.now() });
@@ -367,18 +395,23 @@ export function startClient(): { previous: PreviousSession; updatedFrom: string 
   void engineInfo()
     .then((e) => (engineVersion = `NNCore / Chromium ${e.chromiumVersion}`))
     .catch(() => {});
+
   if (!saved.sharing) {
     const stale = readJson<Queue>(TELEMETRY_QUEUE_DOC);
+
     if (stale?.events?.length || stale?.logs?.length) clearQueue();
+
     return null;
   }
-  const stored = readJson<Queue>(TELEMETRY_QUEUE_DOC);
-  if (stored?.version === 1) queue = { version: 1, events: [...(stored.events ?? []), ...queue.events], logs: [...(stored.logs ?? []), ...queue.logs] };
+
   const previous: PreviousSession = saved.lastVersion === null ? "none" : saved.sessionOpen ? "unclean" : "clean";
   const version = appInfo().appVersion;
   const updatedFrom = saved.lastVersion && saved.lastVersion !== version ? saved.lastVersion : null;
   save({ sessionOpen: true, lastVersion: version });
-  scheduleFlush(10_000);
+
+  // The delivery starts: the queue the app left on disk is merged in, and the grid takes the queue from here.
+  void startDelivery();
+
   return { previous, updatedFrom };
 }
 
@@ -398,17 +431,20 @@ export const devState = () => ({ saved, queued: { events: queue.events.length, l
 function hex(n: number) {
   return Array.from({ length: n }, () => Math.floor(Math.random() * 16).toString(16)).join("");
 }
+
 function variant() {
   return (8 + Math.floor(Math.random() * 4)).toString(16);
 }
 
 export function uuidv4() {
   const h = hex(29);
+
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(12, 15)}-${variant()}${h.slice(15, 18)}-${h.slice(18, 29)}${hex(1)}`;
 }
 
 export function uuidv7() {
   const ms = Date.now().toString(16).padStart(12, "0");
   const h = hex(18);
+
   return `${ms.slice(0, 8)}-${ms.slice(8, 12)}-7${h.slice(0, 3)}-${variant()}${h.slice(3, 6)}-${h.slice(6, 18)}`;
 }

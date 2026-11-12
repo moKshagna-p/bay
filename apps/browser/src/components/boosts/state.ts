@@ -1,15 +1,27 @@
-import { setBoosts as setEngineBoosts, type EngineBoostStyle } from "@bay/nncore";
-import { readDocument, writeDocument } from "@bay/shell";
+import { setBoosts as setEngineBoosts, type EngineBoostStyle } from "@bay/chromium";
+import { readDocument } from "@bay/desktop";
 import { create } from "zustand";
-import { engineBoosts, newBoost, normalizeBoost, normalizeScript, tabBoostStyle, type Boost, type BoostPalette, type BoostScript } from "../../lib/boosts";
+import {
+  BOOSTS_FILE,
+  engineBoosts,
+  newBoost,
+  normalizeBoost,
+  normalizeScript,
+  parseBoostDocument,
+  tabBoostStyle,
+  type Boost,
+  type BoostPalette,
+  type BoostScript,
+} from "../../lib/boosts";
 import { hex, SPACE_COLORS, spaceThemeKey, themeFor } from "../../lib/theme";
 import { onWebviewAttached, webviews } from "../../lib/webviews";
-import { useBrowser, type BrowserState } from "../../store/browser";
+import { useBrowser, type BrowserState } from "../../store/browserStore";
 import { newId } from "../../store/model";
 import { DEFAULT_SPACE } from "../../store/spaces";
 
 // Boosts' store: every Boost (synced: sync/boosts.ts), this Mac's scripts (never synced), and Boosts' own switch.
-// Saved to boosts.json; every change reaches the engine, which restyles the pages it shows at once.
+// The service (service.ts) keeps boosts.json in step with it; every change reaches the engine, which restyles the
+// pages it shows at once.
 
 export type BoostsState = {
   loaded: boolean;
@@ -22,8 +34,6 @@ export type BoostsState = {
   scriptsAcknowledged: boolean;
 };
 
-const FILE = "boosts.json";
-
 export const useBoosts = create<BoostsState>()(() => ({ loaded: false, error: null, on: true, boosts: {}, scripts: {}, scriptsAcknowledged: false }));
 
 let started = false;
@@ -34,7 +44,8 @@ export function startBoosts() {
   load();
   useBoosts.subscribe((s, prev) => {
     if (!s.loaded || s.error) return;
-    if (s.boosts !== prev.boosts || s.scripts !== prev.scripts || s.on !== prev.on || s.scriptsAcknowledged !== prev.scriptsAcknowledged) save(s);
+
+    // The document is the service's business: the store only tells the engine and the tabs.
     if (s.boosts !== prev.boosts || s.scripts !== prev.scripts || s.on !== prev.on) {
       scheduleEngine();
       scheduleTabs();
@@ -47,6 +58,7 @@ export function startBoosts() {
   onWebviewAttached((tabId, handle) => {
     const browser = useBrowser.getState();
     const tab = browser.tabs[tabId];
+
     if (!tab) return;
     const boosts = useBoosts.getState();
     const style = tabBoostStyle(spacePalette(browser, tab.spaceId), Object.values(boosts.boosts), boosts.on);
@@ -59,30 +71,19 @@ export function startBoosts() {
 
 function load() {
   try {
-    const json = readDocument(FILE);
-    const data = json ? (JSON.parse(json) as Record<string, unknown>) : {};
-    const boosts: Record<string, Boost> = {};
-    for (const raw of Object.values((data.boosts as Record<string, unknown>) ?? {})) {
-      const b = normalizeBoost(raw);
-      if (b) boosts[b.id] = b;
-    }
-    const scripts: Record<string, BoostScript> = {};
-    for (const [id, raw] of Object.entries((data.scripts as Record<string, unknown>) ?? {})) {
-      const script = normalizeScript(raw);
-      if (script && boosts[id]) scripts[id] = script;
-    }
-    useBoosts.setState({ loaded: true, error: null, on: data.on !== false, boosts, scripts, scriptsAcknowledged: data.scriptsAcknowledged === true });
+    const document = parseBoostDocument(readDocument(BOOSTS_FILE));
+
+    useBoosts.setState({
+      loaded: true,
+      error: null,
+      on: document.on,
+      boosts: document.boosts,
+      scripts: document.scripts,
+      scriptsAcknowledged: document.scriptsAcknowledged,
+    });
   } catch (error) {
     // An unreadable file is kept as it is, not overwritten: nothing is saved until it's fixed.
     useBoosts.setState({ loaded: true, error: `Couldn't read Boosts: ${String(error)}` });
-  }
-}
-
-function save(s: BoostsState) {
-  try {
-    writeDocument(FILE, JSON.stringify({ version: 1, on: s.on, boosts: s.boosts, scripts: s.scripts, scriptsAcknowledged: s.scriptsAcknowledged }));
-  } catch (error) {
-    console.warn("Couldn't save Boosts", error);
   }
 }
 
@@ -102,9 +103,11 @@ function scheduleEngine() {
 
 function pushEngine() {
   const s = useBoosts.getState();
+
   if (!s.loaded) return;
   const list = engineBoosts(Object.values(s.boosts), s.scripts, s.on);
   const json = JSON.stringify(list);
+
   if (json === lastEngine) return;
   lastEngine = json;
   void setEngineBoosts(list);
@@ -128,6 +131,7 @@ export function spacePalette(s: BrowserState, spaceId: string): BoostPalette {
   const space = s.spaces[spaceId] ?? DEFAULT_SPACE;
   const theme = themeFor(spaceThemeKey(space, s.ui.appDark));
   const colors = space.theme?.colors.length ? space.theme.colors : [(SPACE_COLORS[space.color] ?? SPACE_COLORS.plum).swatch.slice(0, 7)];
+
   return {
     background: hex(theme.windowTint[0]),
     backgroundExtra: hex(theme.windowTint[1]),
@@ -144,17 +148,21 @@ function pushTabs() {
   const boosts = useBoosts.getState();
   const s = useBrowser.getState();
   const styles = new Map<string, { style: EngineBoostStyle; json: string }>();
+
   for (const [tabId, tab] of Object.entries(s.tabs)) {
     let entry = styles.get(tab.spaceId);
+
     if (!entry) {
       const style = tabBoostStyle(spacePalette(s, tab.spaceId), Object.values(boosts.boosts), boosts.on);
       entry = { style, json: JSON.stringify(style) };
       styles.set(tab.spaceId, entry);
     }
+
     if (sentStyles.get(tabId) === entry.json) continue;
     sentStyles.set(tabId, entry.json);
     void webviews.get(tabId)?.setBoostStyle(entry.style);
   }
+
   for (const tabId of sentStyles.keys()) if (!s.tabs[tabId]) sentStyles.delete(tabId);
 }
 
@@ -169,33 +177,39 @@ export const boostsForHost = (s: BoostsState, host: string) =>
 export function createBoost(host: string, name?: string): Boost | null {
   startBoosts();
   const s = useBoosts.getState();
+
   if (s.error || !host) return null;
   const count = boostsForHost(s, host).length;
   const boost = newBoost(newId("boost"), host, Date.now(), name ?? (count ? `My Boost ${count + 1}` : "My Boost"));
   useBoosts.setState({ boosts: { ...s.boosts, [boost.id]: boost } });
+
   return boost;
 }
 
 /** Adds a Boost made elsewhere (an import), with its script off. */
 export function addBoost(boost: Boost, script = "") {
   const s = useBoosts.getState();
+
   if (s.error) return;
   useBoosts.setState({
     boosts: { ...s.boosts, [boost.id]: boost },
-    ...(script ? { scripts: { ...s.scripts, [boost.id]: { code: script, enabled: false, privateWindows: false } } } : {}),
+    ...(script ? { scripts: { ...s.scripts, [boost.id]: { code: script, enabled: false, privateWindows: false } } } : undefined),
   });
 }
 
 export function updateBoost(id: string, patch: Partial<Omit<Boost, "id" | "host" | "createdAt">> | ((b: Boost) => Partial<Boost>)) {
   const s = useBoosts.getState();
   const before = s.boosts[id];
+
   if (!before || s.error) return;
-  const next = normalizeBoost({ ...before, ...(typeof patch === "function" ? patch(before) : patch), id, host: before.host, updatedAt: Date.now() });
+  const next = normalizeBoost({ ...before, ...(patch instanceof Function ? patch(before) : patch), id, host: before.host, updatedAt: Date.now() });
+
   if (next) useBoosts.setState({ boosts: { ...s.boosts, [id]: next } });
 }
 
 export function deleteBoost(id: string) {
   const s = useBoosts.getState();
+
   if (!s.boosts[id] || s.error) return;
   const boosts = { ...s.boosts };
   const scripts = { ...s.scripts };
@@ -206,9 +220,11 @@ export function deleteBoost(id: string) {
 
 export function setBoostScript(id: string, patch: Partial<BoostScript>) {
   const s = useBoosts.getState();
+
   if (!s.boosts[id] || s.error) return;
   const before = s.scripts[id] ?? { code: "", enabled: false, privateWindows: false };
   const next = normalizeScript({ ...before, ...patch });
+
   if (next) useBoosts.setState({ scripts: { ...s.scripts, [id]: next } });
 }
 
@@ -225,17 +241,21 @@ export function removeSelector(id: string, list: "zaps" | "focus", selector: str
 /** Boosts synced from another Mac (sync/boosts.ts): replaces those it names, removes those it deleted. */
 export function applySyncedBoosts(upserts: Boost[], removed: string[]) {
   const s = useBoosts.getState();
+
   if (s.error) return;
   const boosts = { ...s.boosts };
   const scripts = { ...s.scripts };
+
   for (const b of upserts) {
     // Consent belongs to the site where this Mac enabled the script. A synced host edit cannot transfer it.
     if (boosts[b.id]?.host !== b.host && scripts[b.id]) scripts[b.id] = { ...scripts[b.id]!, enabled: false, privateWindows: false };
     boosts[b.id] = b;
   }
+
   for (const id of removed) {
     delete boosts[id];
     delete scripts[id];
   }
+
   useBoosts.setState({ boosts, scripts });
 }

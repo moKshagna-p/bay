@@ -1,25 +1,26 @@
-import { copyText, focusWindow } from "@bay/shell";
+import { copyText, focusWindow } from "@bay/desktop";
 import { useEffect, useState, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { useShallow } from "zustand/react/shallow";
 import { useTheme } from "../../../lib/theme";
-import { deleteLiveFolder, refreshFolder, statusText } from "../../../live/engine";
-import { connectGoogleDrive } from "../../../live/googleAuth";
-import { isMocked } from "../../../live/net";
+import { deleteLiveFolder, refreshFolder, statusText } from "../../../activity/activityEngine";
 import {
+  cancelConnection,
   connectBitbucket,
   connectConfluence,
   connectGithub,
+  connectGoogleDrive,
   connectNotion,
   disconnect,
-  SOURCES,
   startGithubDeviceFlow,
-  type DeviceFlow,
-} from "../../../live/sources";
-import { live, updateConfig, useLive } from "../../../live/store";
-import type { LiveAccount, LiveSourceId } from "../../../live/types";
-import { useBrowser } from "../../../store/browser";
-import { Favicon } from "../../primitives";
+  type DeviceSignIn,
+} from "../../../activity/connections";
+import { isMocked } from "../../../activity/net";
+import { SOURCES } from "../../../activity/sources";
+import { live, updateConfig, useLive } from "../../../activity/activityStore";
+import type { LiveAccount, LiveSourceId } from "../../../activity/types";
+import { useBrowser } from "../../../store/browserStore";
+import { Favicon } from "../../ui/primitives";
 import { Button, Group, Row, SectionHeader, Sheet, TextField } from "../controls";
 import { SETTINGS } from "../definitions";
 import { closeSettingsSheet, showSettingsSheet } from "../sheet";
@@ -37,6 +38,7 @@ export function LiveFoldersPane() {
   const folders = useLive(useShallow((s) => s.folderOrder.map((id) => s.folders[id]!).filter(Boolean)));
   const profiles = useBrowser((s) => s.spaces);
   useLive((s) => s.status);
+
   return (
     <View>
       <SectionHeader
@@ -80,12 +82,14 @@ export function LiveFoldersPane() {
 
 function connectedAs(id: LiveSourceId, account: LiveAccount): string {
   if (!account.name || account.name === account.login) return account.login;
+
   return id === "github" || id === "gdrive" ? `${account.name} (${account.login})` : account.name;
 }
 
 function SourceRow({ id }: { id: LiveSourceId }) {
   const account = useLive((s) => s.accounts[id]);
   const source = SOURCES[id];
+
   return (
     <Row
       icon={<Favicon url={source.site} size={18} />}
@@ -103,11 +107,13 @@ function SourceRow({ id }: { id: LiveSourceId }) {
 
 function browserWindow(): string | null {
   const s = useBrowser.getState();
+
   return s.ui.focusOrder.find((id) => s.windows[id] && !s.windows[id]!.incognito) ?? s.windowOrder.find((id) => !s.windows[id]!.incognito) ?? null;
 }
 
 function openInBrowser(url: string) {
   const windowId = browserWindow();
+
   if (!windowId) return;
   useBrowser.getState().newTab(windowId, { url });
   void focusWindow(windowId);
@@ -117,8 +123,10 @@ function openInBrowser(url: string) {
 async function attempt(task: () => Promise<void>): Promise<string | null> {
   try {
     await task();
+
     return null;
   } catch (e) {
+    // SAFETY: Error)?.message ?? e) assertion matches the runtime value validated at this call site.
     return String((e as Error)?.message ?? e);
   }
 }
@@ -128,15 +136,19 @@ function ConnectSheet({ id }: { id: LiveSourceId }) {
   const source = SOURCES[id];
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
   const run = async (task: () => Promise<void>) => {
     setBusy(true);
     setError(null);
     const failure = await attempt(task);
     setBusy(false);
+
     if (failure === null) closeSettingsSheet();
     else setError(failure);
   };
+
   let body: ReactNode;
+
   switch (id) {
     case "github":
       body = <GithubConnect busy={busy} run={run} />;
@@ -154,6 +166,7 @@ function ConnectSheet({ id }: { id: LiveSourceId }) {
       body = <GoogleConnect busy={busy} run={run} />;
       break;
   }
+
   return (
     <Sheet width={460} onClose={closeSettingsSheet}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 12 }}>
@@ -170,11 +183,13 @@ type ConnectProps = { busy: boolean; run(task: () => Promise<void>): Promise<voi
 
 function Help({ children }: { children: ReactNode }) {
   const theme = useTheme();
+
   return <Text style={{ fontSize: 12, lineHeight: 17, color: theme.textSecondary, marginBottom: 10 }}>{children}</Text>;
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   const theme = useTheme();
+
   return (
     <View style={{ gap: 4, marginBottom: 10 }}>
       <Text style={{ fontSize: 12, fontWeight: "500", color: theme.textPrimary }}>{label}</Text>
@@ -191,7 +206,7 @@ function GithubConnect({ busy, run }: ConnectProps) {
   const theme = useTheme();
   const [token, setToken] = useState("");
   const [clientId, setClientId] = useState(live().config.githubClientId);
-  const [flow, setFlow] = useState<DeviceFlow | null>(null);
+  const [flow, setFlow] = useState<DeviceSignIn | null>(null);
   useEffect(() => () => flow?.cancel(), [flow]);
 
   const signIn = () =>
@@ -221,6 +236,7 @@ function GithubConnect({ busy, run }: ConnectProps) {
       </View>
     );
   }
+
   return (
     <View>
       <Help>Paste a personal access token (classic: "repo" and "read:org" scopes; fine-grained: read access to pull requests, checks and metadata).</Help>
@@ -247,6 +263,7 @@ function BitbucketConnect({ busy, run }: ConnectProps) {
   const [user, setUser] = useState(live().config.bitbucketUser);
   const [token, setToken] = useState("");
   const go = () => void run(() => connectBitbucket(user, token));
+
   return (
     <View>
       <Help>
@@ -270,6 +287,7 @@ function BitbucketConnect({ busy, run }: ConnectProps) {
 function NotionConnect({ busy, run }: ConnectProps) {
   const [token, setToken] = useState("");
   const go = () => void run(() => connectNotion(token));
+
   return (
     <View>
       <Help>
@@ -293,6 +311,7 @@ function ConfluenceConnect({ busy, run }: ConnectProps) {
   const [email, setEmail] = useState(config.confluenceEmail);
   const [token, setToken] = useState("");
   const go = () => void run(() => connectConfluence(site, email, token));
+
   return (
     <View>
       <Help>Create an API token at id.atlassian.com › Security › API tokens, then enter your Confluence Cloud site and account email.</Help>
@@ -316,13 +335,19 @@ function ConfluenceConnect({ busy, run }: ConnectProps) {
 function GoogleConnect({ busy, run }: ConnectProps) {
   const [clientId, setClientId] = useState(live().config.googleClientId);
   const [secret, setSecret] = useState("");
+
+  // The sheet closes while Google is signing in: the sign-in ends, and its tab goes with it.
+  useEffect(() => () => cancelConnection("gdrive"), []);
+
   const go = () =>
     void run(async () => {
       const windowId = browserWindow();
+
       if (!windowId) throw new Error("Open a browser window first");
       void focusWindow(windowId);
       await connectGoogleDrive(windowId, clientId, secret);
     });
+
   return (
     <View>
       <Help>

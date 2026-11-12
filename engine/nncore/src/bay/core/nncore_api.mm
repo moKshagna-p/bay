@@ -99,8 +99,8 @@
 #include "bay/core/nn_installed_bubble.h"
 #include "bay/core/nn_lifetime.h"
 #include "bay/core/nn_main_delegate.h"
-#include "bay/core/nn_navigation_hold.h"
 #include "bay/core/nn_page_channel.h"
+#include "bay/core/nn_request_filter.h"
 #include "bay/core/nn_password_prompt.h"
 #include "bay/core/nn_tab_info.h"
 #include "bay/core/nn_permissions.h"
@@ -132,9 +132,7 @@
 #include "chrome/browser/profiles/nuke_profile_directory_utils.h"
 #include "chrome/browser/profiles/profile_destroyer.h"
 #include "chrome/browser/profiles/profile_metrics.h"
-#include "chrome/browser/extensions/component_loader.h"
 #include "extensions/common/manifest.h"
-#include "extensions/common/mojom/manifest.mojom-shared.h"
 #include "bay/core/nn_external_apps.h"
 #include "base/base64.h"
 #include "chrome/browser/extensions/api/side_panel/side_panel_service.h"
@@ -1039,6 +1037,35 @@ void WatchTracingStart(std::shared_ptr<TracingStart> start, int checks_left) {
   nncore::SetBoosts(std::move(list));
 }
 
++ (void)setRequestFilter:(NNCoreRequestFilter)filter {
+  nncore::SetRequestFilter(filter);
+}
+
++ (void)setContentSecurityPolicySource:(NNCoreContentSecurityPolicySource)source {
+  nncore::SetContentSecurityPolicySource(source);
+}
+
++ (void)setResponseFilter:(NNCoreResponseFilter)filter {
+  nncore::SetResponseFilter(filter);
+}
+
++ (void)setBodyFilterGate:(NNCoreBodyFilterGate)gate filter:(NNCoreBodyFilter)filter {
+  nncore::SetBodyFilter(gate, filter);
+}
+
++ (void)setRequestHeaderNames:(NNCoreRequestHeaderNames)names
+                       filter:(NNCoreRequestHeaderFilter)filter {
+  nncore::SetRequestHeaderFilter(names, filter);
+}
+
++ (void)setCnameFilter:(NNCoreCnameFilter)filter {
+  nncore::SetCnameFilter(filter);
+}
+
++ (void)setScriptletSource:(NNCoreScriptletSource)source {
+  nncore::SetScriptletSource(source);
+}
+
 + (void)setAutoPictureInPicture:(BOOL)enabled {
   g_auto_picture_in_picture = enabled;
   for (Profile* profile : g_browser_process->profile_manager()->GetLoadedProfiles()) {
@@ -1354,56 +1381,6 @@ void WatchTracingStart(std::shared_ptr<TracingStart> start, int checks_left) {
   remover->RemoveAndReply(begin, base::Time::Max(), mask,
                           content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB,
                           new BrowsingDataDone(remover, completion));
-}
-
-- (NSString*)loadComponentExtension:(NSString*)path {
-  if (!_profile || !path.length) {
-    return nil;
-  }
-  const base::FilePath root(base::SysNSStringToUTF8(path));
-  // Already running from there: nothing to do (a reload would restart its worker).
-  for (const auto& extension :
-       extensions::ExtensionRegistry::Get(_profile.get())->enabled_extensions()) {
-    if (extension->location() == extensions::mojom::ManifestLocation::kComponent &&
-        extension->path() == root) {
-      return NS(extension->id());
-    }
-  }
-  // Chrome's component extensions (its own built-ins): the manifest's key fixes the id;
-  // hidden from chrome://extensions and the user's list, as CEF's LoadComponentExtension.
-  extensions::ComponentLoader* loader = extensions::ComponentLoader::Get(_profile.get());
-  if (!loader) {
-    return nil;
-  }
-  const std::string extension_id = loader->AddOrReplace(root);
-  return extension_id.empty() ? nil : NS(extension_id);
-}
-
-- (void)holdNavigationsUntilRulesetsOf:(NSString*)extensionId {
-  if (_profile) {
-    nncore::HoldNavigationsForRulesets(_profile.get(), base::SysNSStringToUTF8(extensionId));
-  }
-}
-
-- (void)releaseNavigationHold:(NSString*)reason {
-  if (_profile) {
-    nncore::ReleaseNavigationHold(_profile.get(), base::SysNSStringToUTF8(reason));
-  }
-}
-
-- (void)releaseNavigationHoldReady {
-  if (_profile) {
-    nncore::ReleaseNavigationHoldReady(_profile.get());
-  }
-}
-
-- (void)unloadComponentExtension:(NSString*)extensionId {
-  if (!_profile) {
-    return;
-  }
-  if (extensions::ComponentLoader* loader = extensions::ComponentLoader::Get(_profile.get())) {
-    loader->Remove(extensions::ExtensionId(base::SysNSStringToUTF8(extensionId)));
-  }
 }
 
 - (void)watchCastRoutes {
@@ -2473,6 +2450,14 @@ TabSharingInfoBarDelegate* TabSharingDelegateFor(content::WebContents* contents,
   if (_contents) {
     nncore::PageChannel::GetOrCreate(_contents)->SetBoostStyle(
         css ? base::SysNSStringToUTF8(css) : std::string());
+  }
+}
+
+- (void)insertUserStyle:(NSString*)css frame:(NSString*)frameId origin:(NSString*)origin {
+  if (_contents) {
+    nncore::PageChannel::GetOrCreate(_contents)->InsertUserStyle(
+        base::SysNSStringToUTF8(frameId), base::SysNSStringToUTF8(css),
+        base::SysNSStringToUTF8(origin));
   }
 }
 

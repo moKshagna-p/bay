@@ -1,26 +1,49 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Cdp, ConnectionLost } from "../src/cdp.ts";
-import { runCode } from "../src/runner.ts";
+import { runCode, runCodeEffect } from "../src/runner.ts";
+import { runTest } from "../src/scriptsTest.ts";
+import { parseMeta } from "../src/userscript.ts";
 import { ForbiddenCommand } from "../src/guard.ts";
 import type { Endpoint } from "../src/endpoint.ts";
 import { join } from "node:path";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 
 describe("CDP connection lifecycle", () => {
   let server: ReturnType<typeof Bun.serve>;
   let endpoint: Endpoint;
+  let holdMethod: string | null;
+  let commandReceived: () => void;
+  let connectionClosed: () => void;
   beforeEach(() => {
+    holdMethod = null;
+    commandReceived = () => {};
+
+    connectionClosed = () => {};
+
     server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       fetch(request, server) {
         if (server.upgrade(request, { data: undefined })) return;
+
         return new Response(null, { status: 404 });
       },
       websocket: {
         message(socket, raw) {
           const command = JSON.parse(String(raw));
+
+          if (command.method === holdMethod) {
+            commandReceived();
+
+            return;
+          }
+
           if (command.method === "Test.wait") return;
           else socket.send(JSON.stringify({ id: command.id, result: { targetInfos: [] } }));
+        },
+        close() {
+          connectionClosed();
         },
       },
     });
@@ -31,8 +54,66 @@ describe("CDP connection lifecycle", () => {
   it("returns exec values through a real websocket", async () => {
     expect(await runCode("({ result: await Promise.resolve(42) })", "fixture.ts", endpoint, 1)).toEqual({ result: 42 });
   });
+  it("interrupts exec while its initial target query is pending and closes the connection", async () => {
+    holdMethod = "Target.getTargets";
+    const queried = new Promise<void>((resolve) => (commandReceived = resolve));
+    const closed = new Promise<void>((resolve) => (connectionClosed = resolve));
+    const controller = new AbortController();
+    const running = Effect.runPromiseExit(runCodeEffect("42", "fixture.ts", endpoint, 1), { signal: controller.signal });
+
+    try {
+      await queried;
+      controller.abort();
+
+      const interrupted = await Promise.race([running.then(() => true), Bun.sleep(300).then(() => false)]);
+
+      expect(interrupted).toBe(true);
+      expect(Exit.isFailure(await running)).toBe(true);
+      expect(await Promise.race([closed.then(() => true), Bun.sleep(300).then(() => false)])).toBe(true);
+    } finally {
+      server.stop(true);
+      await running;
+    }
+  });
+
+  it("interrupts a scripts test while its connection is opening", async () => {
+    let handshakeReceived!: () => void;
+    let finishHandshake!: () => void;
+    const handshake = new Promise<void>((resolve) => (handshakeReceived = resolve));
+
+    const pendingServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        handshakeReceived();
+
+        return new Promise<Response>((resolve) => (finishHandshake = () => resolve(new Response(null, { status: 503 }))));
+      },
+    });
+
+    const pendingEndpoint = { ...endpoint, ws: `ws://127.0.0.1:${pendingServer.port}/devtools/browser/test` };
+    const controller = new AbortController();
+    const script = { meta: parseMeta("", "fixture.js"), source: "", path: "fixture.js", js: "", sourcemap: null, warnings: [] };
+
+    const running = Effect.runPromiseExit(runTest(script, "https://example.com", pendingEndpoint, undefined, 0, undefined, false), {
+      signal: controller.signal,
+    });
+
+    try {
+      await handshake;
+      controller.abort();
+
+      expect(await Promise.race([running.then(() => true), Bun.sleep(300).then(() => false)])).toBe(true);
+      expect(Exit.isFailure(await running)).toBe(true);
+    } finally {
+      finishHandshake();
+      pendingServer.stop(true);
+      await running;
+    }
+  });
   it("rejects browser shutdown commands", async () => {
     const cdp = new Cdp(endpoint.ws);
+
     try {
       await cdp.open(1000);
       await expect(cdp.send("Browser.close")).rejects.toBeInstanceOf(ForbiddenCommand);
@@ -42,6 +123,7 @@ describe("CDP connection lifecycle", () => {
   });
   it("rejects in-flight commands on connection loss", async () => {
     const cdp = new Cdp(endpoint.ws);
+
     try {
       await cdp.open(1000);
       const pending = cdp.send("Test.wait");
@@ -53,11 +135,14 @@ describe("CDP connection lifecycle", () => {
   });
   it("exits 130 on SIGINT and releases its connection", async () => {
     const cli = join(import.meta.dir, "../bin/bay.ts");
+
     const child = Bun.spawn([process.execPath, cli, "exec", 'console.log("ready"); await new Promise(() => {})', "--ws", endpoint.ws], {
       stdout: "pipe",
       stderr: "pipe",
     });
+
     const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
+
     try {
       const reader = child.stdout.getReader();
       const { value } = await reader.read();
@@ -72,6 +157,7 @@ describe("CDP connection lifecycle", () => {
   });
   it("clears the default timeout so an embedded exec process can exit", async () => {
     const runnerUrl = new URL("../src/runner.ts", import.meta.url).href;
+
     const child = Bun.spawn(
       [
         process.execPath,
@@ -80,7 +166,9 @@ describe("CDP connection lifecycle", () => {
       ],
       { stdout: "pipe", stderr: "pipe" },
     );
+
     const timer = setTimeout(() => child.kill(), 2000);
+
     try {
       expect(await child.exited).toBe(0);
       expect(await new Response(child.stdout).text()).toBe("42\n");

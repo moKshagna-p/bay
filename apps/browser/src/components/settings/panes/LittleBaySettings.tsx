@@ -1,11 +1,15 @@
-import { cancelShortcutRecording, menuShortcuts, recordShortcut, type HotKeyStatus, type MenuShortcut } from "@bay/shell";
+import { menuShortcuts, type HotKeyStatus, type MenuShortcut } from "@bay/desktop";
 import { useEffect, useState } from "react";
-import { useBrowser } from "../../../store/browser";
+import { useBrowser } from "../../../store/browserStore";
 import type { LittleBayShortcut } from "../../../store/settings";
 import { DEFAULT_LITTLE_BAY_SHORTCUT, useLittleBayAccess } from "../../littleBay/access";
 import { Group, PopUp, Row, SectionHeader, SettingToggle, Toggle } from "../controls";
 import { SETTINGS } from "../definitions";
 import { comboId, formatShortcut, ShortcutField } from "./Shortcuts";
+import { withWorkflows } from "../settingsCommands";
+
+// The recorder this pane is: closing it stops its own recording, and no other pane's.
+const RECORDER = "littleBay";
 
 const PUT_AWAY_CHOICES = [
   { value: "1", title: "After 1 hour" },
@@ -26,15 +30,18 @@ export function LittleBaySettings() {
   const [menus, setMenus] = useState<MenuShortcut[]>([]);
   useEffect(() => {
     void menuShortcuts().then(setMenus);
-    return () => void cancelShortcutRecording();
+
+    // The pane's recording stops with the pane.
+    return () => void withWorkflows((w) => w.stopRecording(RECORDER));
   }, []);
 
   const record = async () => {
     setRecording(true);
-    const combo = await recordShortcut();
+    const combo = await withWorkflows((w) => w.record(RECORDER));
     setRecording(false);
     // A global shortcut needs ⌘, ⌥ or ⌃: a bare key or ⇧ and a key would take typing from every app.
     const modifiers = (combo?.modifiers ?? []).filter((m): m is LittleBayShortcut["modifiers"][number] => m !== "function");
+
     if (!combo || !modifiers.some((m) => m !== "shift")) return;
     update({ littleBayShortcut: { key: combo.key, keyCode: combo.keyCode, modifiers } });
   };
@@ -44,11 +51,14 @@ export function LittleBaySettings() {
     ? menus.find((item) => {
         const own = overrides[item.id];
         const combo = own ? { key: own[0] ?? "", modifiers: own.slice(1) } : { key: item.defaultKey, modifiers: item.defaultModifiers };
+
         return item.title !== "New Little Bay Window" && comboId(combo) === comboId(shortcut);
       })
     : undefined;
+
   // A time chosen elsewhere (not one of the choices) stays listed, as itself.
   const hoursValue = hours === null ? "never" : String(hours);
+
   const putAwayChoices = PUT_AWAY_CHOICES.some((c) => c.value === hoursValue)
     ? PUT_AWAY_CHOICES
     : [...PUT_AWAY_CHOICES, { value: hoursValue, title: `After ${hours} hours` }];
@@ -95,7 +105,10 @@ export function LittleBaySettings() {
 function shortcutDescription(shortcut: LittleBayShortcut | null, status: HotKeyStatus, clash: MenuShortcut | undefined): string {
   if (!shortcut) return "A shortcut that opens Little Bay ready to type, even when Bay is in the background.";
   const keys = formatShortcut(shortcut);
+
   if (status === "taken") return `${keys} is taken by another app or by macOS. Choose another.`;
+
   if (clash) return `Also Bay's ${clash.title}: in Bay, ${keys} opens Little Bay instead.`;
+
   return `${keys} opens Little Bay ready to type, from any app.`;
 }
